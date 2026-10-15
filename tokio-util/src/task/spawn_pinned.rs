@@ -1,10 +1,9 @@
-use futures_util::future::{AbortHandle, Abortable};
+use super::AbortOnDropHandle;
 use std::fmt;
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 use tokio::task::{spawn_local, JoinHandle};
 
@@ -14,6 +13,9 @@ use tokio::task::{spawn_local, JoinHandle};
 /// in the pool. Consequently you can also use [`tokio::task::spawn_local`] (which will
 /// execute on the same thread) inside the Future you supply to the various spawn methods
 /// of `LocalPoolHandle`.
+///
+/// A worker remains alive while tasks spawned through the pool are in flight,
+/// even after the pool handles have been dropped.
 ///
 /// [`tokio::runtime::LocalRuntime`]: tokio::runtime::LocalRuntime
 /// [`tokio::task::spawn_local`]: tokio::task::spawn_local
@@ -219,72 +221,25 @@ impl LocalPool {
         Fut: Future + 'static,
         Fut::Output: Send + 'static,
     {
-        let (sender, receiver) = oneshot::channel();
         let (worker, job_guard) = match worker_choice {
             WorkerChoice::LeastBurdened => self.find_and_incr_least_burdened_worker(),
             WorkerChoice::ByIdx(idx) => self.find_worker_by_idx(idx),
         };
-        let worker_spawner = worker.spawner.clone();
+        let worker_guard = worker.worker_guard.clone();
 
-        // Spawn a future onto the worker's runtime so we can immediately return
-        // a join handle.
         worker.runtime_handle.spawn(async move {
-            // Move the job guard into the task
             let _job_guard = job_guard;
+            let _worker_guard = worker_guard;
 
-            // Propagate aborts via Abortable/AbortHandle
-            let (abort_handle, abort_registration) = AbortHandle::new_pair();
-            let _abort_guard = AbortGuard(abort_handle);
-
-            // Inside the future we can't run spawn_local yet because we're not
-            // in the context of a LocalRuntime. We need to send create_task to the
-            // LocalRuntime task for spawning.
-            let spawn_task = Box::new(move || {
-                // Once we're in the LocalRuntime context we can call spawn_local
-                let join_handle =
-                    spawn_local(
-                        async move { Abortable::new(create_task(), abort_registration).await },
-                    );
-
-                // Send the join handle back to the spawner. If sending fails,
-                // we assume the parent task was canceled, so cancel this task
-                // as well.
-                if let Err(join_handle) = sender.send(join_handle) {
-                    join_handle.abort()
-                }
-            });
-
-            // Send the callback to the LocalRuntime task
-            if let Err(e) = worker_spawner.send(spawn_task) {
-                // Propagate the error as a panic in the join handle.
-                panic!("Failed to send job to worker: {e}");
-            }
-
-            // Wait for the task's join handle
-            let join_handle = match receiver.await {
-                Ok(handle) => handle,
-                Err(e) => {
-                    // We sent the task successfully, but failed to get its
-                    // join handle... We assume something happened to the worker
-                    // and the task was not spawned. Propagate the error as a
-                    // panic in the join handle.
-                    panic!("Worker failed to send join handle: {e}");
-                }
-            };
-
-            // Wait for the task to complete
-            let join_result = join_handle.await;
+            // A task running on the worker's LocalRuntime can spawn locally
+            // without dispatching a separate creation callback.
+            let mut join_handle =
+                AbortOnDropHandle::new(spawn_local(async move { create_task().await }));
+            let join_result = (&mut join_handle).await;
+            drop(join_handle.detach());
 
             match join_result {
-                Ok(Ok(output)) => output,
-                Ok(Err(_)) => {
-                    // Pinned task was aborted. But that only happens if this
-                    // task is aborted. So this is an impossible branch.
-                    unreachable!(
-                        "Reaching this branch means this task was previously \
-                         aborted but it continued running anyways"
-                    )
-                }
+                Ok(output) => output,
                 Err(e) => {
                     if e.is_panic() {
                         std::panic::resume_unwind(e.into_panic());
@@ -357,33 +312,21 @@ impl Drop for JobCountGuard {
     }
 }
 
-/// Calls abort on the handle when dropped.
-struct AbortGuard(AbortHandle);
-
-impl Drop for AbortGuard {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
-type PinnedFutureSpawner = Box<dyn FnOnce() + Send + 'static>;
-
 struct LocalWorkerHandle {
     runtime_handle: tokio::runtime::Handle,
-    spawner: UnboundedSender<PinnedFutureSpawner>,
+    worker_guard: Arc<oneshot::Sender<()>>,
     task_count: Arc<AtomicUsize>,
 }
 
 impl LocalWorkerHandle {
     /// Create a new worker for executing pinned tasks
     fn new_worker() -> LocalWorkerHandle {
-        let (sender, receiver) = unbounded_channel();
+        let (worker_guard, shutdown_receiver) = oneshot::channel();
         let (handle_sender, handle_receiver) = std::sync::mpsc::channel();
 
         let task_count = Arc::new(AtomicUsize::new(0));
-        let task_count_clone = Arc::clone(&task_count);
 
-        std::thread::spawn(|| Self::run(handle_sender, receiver, task_count_clone));
+        std::thread::spawn(|| Self::run(handle_sender, shutdown_receiver));
 
         let runtime_handle = handle_receiver
             .recv()
@@ -392,15 +335,14 @@ impl LocalWorkerHandle {
 
         LocalWorkerHandle {
             runtime_handle,
-            spawner: sender,
+            worker_guard: Arc::new(worker_guard),
             task_count,
         }
     }
 
     fn run(
         handle_sender: std::sync::mpsc::Sender<std::io::Result<tokio::runtime::Handle>>,
-        mut task_receiver: UnboundedReceiver<PinnedFutureSpawner>,
-        task_count: Arc<AtomicUsize>,
+        shutdown_receiver: oneshot::Receiver<()>,
     ) {
         let runtime = match tokio::runtime::LocalRuntime::new() {
             Ok(runtime) => runtime,
@@ -417,35 +359,15 @@ impl LocalWorkerHandle {
             .expect("Failed to send local runtime handle");
         drop(handle_sender);
 
-        runtime.block_on(async {
-            while let Some(spawn_task) = task_receiver.recv().await {
-                // Calls spawn_local(future)
-                (spawn_task)();
-            }
-        });
+        // The sender is shared by the pool and its in-flight proxy tasks.
+        // Dropping the last owner signals that the worker can shut down.
+        let _ = runtime.block_on(shutdown_receiver);
 
-        // If there are any tasks on the runtime that has already completed,
-        // but whose output has not yet been reported, let that task complete.
-        //
-        // Since the task_count is decremented when the runtime task exits,
-        // reading that counter lets us know if any such tasks completed during
-        // the call to `block_on`.
-        let mut previous_task_count = task_count.load(Ordering::SeqCst);
-        loop {
-            // This call will also run tasks spawned on the runtime.
-            runtime.block_on(tokio::task::yield_now());
-            let new_task_count = task_count.load(Ordering::SeqCst);
-            if new_task_count == previous_task_count {
-                break;
-            } else {
-                previous_task_count = new_task_count;
-            }
-        }
+        // Give ready tasks spawned directly on the worker one last turn before
+        // cancelling any that are still pending.
+        runtime.block_on(tokio::task::yield_now());
 
-        // It's now no longer possible for a task on the local runtime
-        // associated with task that has completed. Drop both
-        // local runtime to let tasks on the runtime be cancelled if and
-        // only if they are still on the runtime.
+        // Cancel any remaining tasks spawned directly on the worker.
         drop(runtime);
     }
 }

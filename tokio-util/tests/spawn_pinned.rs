@@ -237,3 +237,50 @@ async fn spawn_by_idx() {
 
     assert_ne!(thread_id1, thread_id2);
 }
+
+#[test]
+fn queued_task_cancellation_releases_resources() {
+    let pool = task::LocalPoolHandle::new(1);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let (started, worker_started) = std::sync::mpsc::channel();
+    let (release, worker_release) = std::sync::mpsc::channel();
+    let blocker = pool.spawn_pinned(|| async move {
+        started.send(()).unwrap();
+        worker_release.recv().unwrap();
+    });
+    worker_started.recv().unwrap();
+
+    let (dropped, resource_dropped) = tokio::sync::oneshot::channel::<()>();
+    let victim = pool.spawn_pinned(move || {
+        let local = Rc::new(dropped);
+        async move {
+            let _local = local;
+            futures::future::pending::<()>().await;
+        }
+    });
+    victim.abort();
+    release.send(()).unwrap();
+
+    rt.block_on(blocker).unwrap();
+    assert!(rt.block_on(victim).unwrap_err().is_cancelled());
+    assert!(rt.block_on(resource_dropped).is_err());
+}
+
+#[tokio::test]
+async fn dropping_pool_keeps_in_flight_task_alive() {
+    let pool = task::LocalPoolHandle::new(1);
+    let (started, task_started) = tokio::sync::oneshot::channel();
+    let (release, task_release) = tokio::sync::oneshot::channel();
+    let handle = pool.spawn_pinned(|| async move {
+        let local = Rc::new(42);
+        started.send(()).unwrap();
+        task_release.await.unwrap();
+        *local
+    });
+    task_started.await.unwrap();
+    drop(pool);
+    release.send(()).unwrap();
+    assert_eq!(handle.await.unwrap(), 42);
+}
