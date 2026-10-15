@@ -565,6 +565,9 @@ impl Semaphore {
     /// Adds `n` new permits to the semaphore.
     ///
     /// The maximum number of permits is [`Semaphore::MAX_PERMITS`], and this function will panic if the limit is exceeded.
+    ///
+    /// If a waiter's wake callback panics, permits are still distributed before
+    /// the panic is propagated.
     pub fn add_permits(&self, n: usize) {
         self.ll_sem.release(n);
     }

@@ -178,6 +178,74 @@ fn close_wakes_all_waiters() {
 }
 
 #[test]
+#[cfg(panic = "unwind")]
+#[cfg(not(target_family = "wasm"))]
+fn wake_panics_preserve_permits_and_notify_remaining_waiters() {
+    use futures::task::{waker, ArcWake};
+    use std::future::Future;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::task::{Context, Poll};
+
+    struct PanicWake(&'static str);
+    impl ArcWake for PanicWake {
+        fn wake_by_ref(arc_self: &Arc<Self>) {
+            std::panic::panic_any(arc_self.0);
+        }
+    }
+
+    struct CountWakes(AtomicUsize);
+    impl ArcWake for CountWakes {
+        fn wake_by_ref(arc_self: &Arc<Self>) {
+            arc_self.0.fetch_add(1, SeqCst);
+        }
+    }
+
+    for close in [false, true] {
+        let semaphore = Semaphore::new(0);
+        let wakes = Arc::new(CountWakes(AtomicUsize::new(0)));
+        let normal = waker(wakes.clone());
+        let first = waker(Arc::new(PanicWake("first wake panic")));
+        let later = waker(Arc::new(PanicWake("later wake panic")));
+        // Cross wake-batch boundaries, with panics in different batches.
+        let mut acquires: Vec<_> = (0..65).map(|_| Box::pin(semaphore.acquire())).collect();
+        for (i, acquire) in acquires.iter_mut().enumerate() {
+            let waker = match i {
+                0 => &first,
+                32 => &later,
+                _ => &normal,
+            };
+            assert!(acquire
+                .as_mut()
+                .poll(&mut Context::from_waker(waker))
+                .is_pending());
+        }
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if close {
+                semaphore.close();
+            } else {
+                semaphore.add_permits(100);
+            }
+        }))
+        .unwrap_err()
+        .downcast::<&'static str>()
+        .unwrap();
+        assert_eq!(*panic, "first wake panic");
+        assert_eq!(wakes.0.load(SeqCst), 63);
+
+        for acquire in &mut acquires {
+            match acquire.as_mut().poll(&mut Context::from_waker(&normal)) {
+                Poll::Ready(Ok(permit)) if !close => drop(permit),
+                Poll::Ready(Err(_)) if close => {}
+                result => panic!("unexpected acquisition result: {result:?}"),
+            }
+        }
+        drop(acquires);
+        assert_eq!(semaphore.available_permits(), if close { 0 } else { 100 });
+    }
+}
+
+#[test]
 fn forget() {
     let sem = Arc::new(Semaphore::new(1));
     {

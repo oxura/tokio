@@ -1,5 +1,7 @@
 use core::mem::MaybeUninit;
 use core::ptr;
+use std::any::Any;
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::task::Waker;
 
 const NUM_WAKERS: usize = 32;
@@ -12,6 +14,31 @@ const NUM_WAKERS: usize = 32;
 pub(crate) struct WakeList {
     inner: [MaybeUninit<Waker>; NUM_WAKERS],
     curr: usize,
+}
+
+/// Hold wake panics until the caller has restored its bookkeeping.
+#[derive(Default)]
+pub(crate) struct WakeListPanic {
+    first: Option<Box<dyn Any + Send>>,
+    // Retain later payloads too: dropping arbitrary user data may itself panic.
+    others: Vec<Box<dyn Any + Send>>,
+}
+
+impl WakeListPanic {
+    fn capture(&mut self, panic: Box<dyn Any + Send>) {
+        if self.first.is_none() {
+            self.first = Some(panic);
+        } else {
+            self.others.push(panic);
+        }
+    }
+
+    pub(crate) fn resume(self) {
+        drop(self.others);
+        if let Some(panic) = self.first {
+            resume_unwind(panic);
+        }
+    }
 }
 
 impl WakeList {
@@ -37,6 +64,12 @@ impl WakeList {
     }
 
     pub(crate) fn wake_all(&mut self) {
+        let mut panics = WakeListPanic::default();
+        self.wake_all_defer_panic(&mut panics);
+        panics.resume();
+    }
+
+    pub(crate) fn wake_all_defer_panic(&mut self, panics: &mut WakeListPanic) {
         struct DropGuard {
             start: *mut Waker,
             end: *mut Waker,
@@ -67,8 +100,9 @@ impl WakeList {
             let waker = unsafe { ptr::read(guard.start) };
             // SAFETY: The resulting pointer is in bounds or one after the length of the same object.
             guard.start = unsafe { guard.start.add(1) };
-            // If this panics, then `guard` will clean up the remaining wakers.
-            waker.wake();
+            if let Err(panic) = catch_unwind(AssertUnwindSafe(|| waker.wake())) {
+                panics.capture(panic);
+            }
         }
     }
 }

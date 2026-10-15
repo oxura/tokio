@@ -21,7 +21,7 @@ use crate::loom::sync::{Mutex, MutexGuard};
 use crate::util::linked_list::{self, LinkedList};
 #[cfg(all(tokio_unstable, feature = "tracing"))]
 use crate::util::trace;
-use crate::util::WakeList;
+use crate::util::{WakeList, WakeListPanic};
 
 use std::future::Future;
 use std::marker::PhantomPinned;
@@ -262,6 +262,7 @@ impl Semaphore {
         // waker may call back into the semaphore when it is woken or dropped.
         // No new waiters are queued once `closed` is set.
         let mut wakers = WakeList::new();
+        let mut panics = WakeListPanic::default();
         loop {
             while wakers.can_push() {
                 let Some(mut waiter) = waiters.queue.pop_back() else {
@@ -277,9 +278,10 @@ impl Semaphore {
             // If the batch has room left, the queue is empty.
             let is_empty = wakers.can_push();
             drop(waiters);
-            wakers.wake_all();
+            wakers.wake_all_defer_panic(&mut panics);
 
             if is_empty {
+                panics.resume();
                 return;
             }
             waiters = self.waiters.lock();
@@ -333,6 +335,7 @@ impl Semaphore {
     /// remainder are assigned back to the semaphore.
     fn add_permits_locked(&self, mut rem: usize, waiters: MutexGuard<'_, Waitlist>) {
         let mut wakers = WakeList::new();
+        let mut panics = WakeListPanic::default();
         let mut lock = Some(waiters);
         let mut is_empty = false;
         while rem > 0 {
@@ -398,10 +401,11 @@ impl Semaphore {
 
             drop(waiters); // release the lock
 
-            wakers.wake_all();
+            wakers.wake_all_defer_panic(&mut panics);
         }
 
         assert_eq!(rem, 0);
+        panics.resume();
     }
 
     /// Decrease a semaphore's permits by a maximum of `n`.

@@ -41,6 +41,8 @@ mod wake_list;
     feature = "time",
 ))]
 pub(crate) use wake_list::WakeList;
+#[cfg(any(feature = "fs", feature = "sync"))]
+pub(crate) use wake_list::WakeListPanic;
 
 #[cfg(any(
     feature = "fs",
