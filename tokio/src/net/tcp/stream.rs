@@ -164,7 +164,10 @@ impl TcpStream {
     }
 
     pub(crate) fn new(connected: mio::net::TcpStream) -> io::Result<TcpStream> {
-        let io = PollEvented::new(connected)?;
+        let interest = Interest::READABLE | Interest::WRITABLE;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let interest = interest | Interest::PRIORITY;
+        let io = PollEvented::new_with_interest(connected, interest)?;
         Ok(TcpStream { io })
     }
 
@@ -225,9 +228,7 @@ impl TcpStream {
     pub fn from_std(stream: std::net::TcpStream) -> io::Result<TcpStream> {
         check_socket_for_blocking(&stream)?;
 
-        let io = mio::net::TcpStream::from_std(stream);
-        let io = PollEvented::new(io)?;
-        Ok(TcpStream { io })
+        Self::new(mio::net::TcpStream::from_std(stream))
     }
 
     /// Turns a [`tokio::net::TcpStream`] into a [`std::net::TcpStream`].
@@ -411,6 +412,9 @@ impl TcpStream {
     /// This function is usually paired with `try_read()` or `try_write()`. It
     /// can be used to concurrently read / write to the same socket on a single
     /// task without splitting the socket.
+    ///
+    /// On Linux and Android, priority readiness reports out-of-band TCP data.
+    /// Use [`Self::try_io`] with the corresponding OS operation to receive it.
     ///
     /// The function may complete without the socket being ready. This is a
     /// false-positive and attempting an operation will return with

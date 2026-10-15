@@ -437,3 +437,64 @@ async fn write_closed() {
 
     assert!(!ready_event.is_write_closed());
 }
+
+#[cfg(feature = "time")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
+async fn check_priority_readiness(stream: &TcpStream, peer: &impl std::os::fd::AsRawFd) {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: The descriptor is live and the one-byte buffer is valid.
+    let sent = unsafe { libc::send(peer.as_raw_fd(), b"!".as_ptr().cast(), 1, libc::MSG_OOB) };
+    assert_eq!(sent, 1);
+
+    let ready = tokio::time::timeout(Duration::from_secs(10), stream.ready(Interest::PRIORITY))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(ready.is_priority());
+
+    let mut byte = [0u8; 1];
+    let received = stream
+        .try_io(Interest::PRIORITY, || {
+            // SAFETY: The descriptor is live and the one-byte buffer is valid.
+            let n = unsafe {
+                libc::recv(
+                    stream.as_raw_fd(),
+                    byte.as_mut_ptr().cast(),
+                    byte.len(),
+                    libc::MSG_OOB,
+                )
+            };
+            if n < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(n)
+            }
+        })
+        .unwrap();
+    assert_eq!(received, 1);
+    assert_eq!(byte, *b"!");
+}
+
+#[cfg(feature = "time")]
+#[tokio::test]
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg_attr(miri, ignore)] // No `socket` on miri.
+async fn priority_readiness_connect_and_accept() {
+    let (client, server) = create_pair().await;
+    check_priority_readiness(&client, &server).await;
+    check_priority_readiness(&server, &client).await;
+}
+
+#[cfg(feature = "time")]
+#[tokio::test]
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg_attr(miri, ignore)] // No `socket` on miri.
+async fn priority_readiness_from_std() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let stream = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (peer, _) = listener.accept().unwrap();
+    stream.set_nonblocking(true).unwrap();
+    let stream = TcpStream::from_std(stream).unwrap();
+    check_priority_readiness(&stream, &peer).await;
+}
