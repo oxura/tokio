@@ -232,14 +232,16 @@ impl Registration {
 
             let coop = std::future::poll_fn(crate::task::coop::poll_proceed).await;
 
-            match f() {
+            let result = f();
+            // An attempted operation consumes budget even if cached readiness
+            // was a false positive, so repeated retries cannot starve other tasks.
+            coop.made_progress();
+
+            match result {
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                     self.clear_readiness(event);
                 }
-                x => {
-                    coop.made_progress();
-                    return x;
-                }
+                x => return x,
             }
         }
     }

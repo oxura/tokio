@@ -1055,6 +1055,9 @@ impl TcpStream {
     /// This loop is repeated until the closure returns an `Ok` or an error
     /// other than `WouldBlock`.
     ///
+    /// Each attempted operation consumes cooperative scheduling budget, including
+    /// attempts that return `WouldBlock`.
+    ///
     /// The closure should only return a `WouldBlock` error if it has performed
     /// an IO operation on the socket that failed due to the socket not being
     /// ready. Returning a `WouldBlock` error in any other situation will

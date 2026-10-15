@@ -91,3 +91,61 @@ async fn test_has_budget_remaining() {
 
     assert!(!has_budget_remaining());
 }
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)] // No `socket` on miri.
+async fn async_io_would_block_retries_yield() {
+    use std::io;
+    use std::os::fd::AsRawFd;
+    use std::sync::atomic::AtomicBool;
+    use tokio::io::Interest;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (stream, _) = listener.accept().await.unwrap();
+    peer.shutdown(std::net::Shutdown::Write).unwrap();
+    while !stream
+        .ready(Interest::READABLE)
+        .await
+        .unwrap()
+        .is_read_closed()
+    {
+        tokio::task::yield_now().await;
+    }
+
+    let progressed = Arc::new(AtomicBool::new(false));
+    let observed = progressed.clone();
+    let observer = tokio::spawn(async move {
+        observed.store(true, Ordering::Relaxed);
+    });
+    let mut attempts = 0;
+    stream
+        .async_io(Interest::READABLE, || {
+            let mut byte = [0u8; 1];
+            // SAFETY: The descriptor is live and the one-byte buffer is valid.
+            let n = unsafe {
+                libc::recv(
+                    stream.as_raw_fd(),
+                    byte.as_mut_ptr().cast(),
+                    byte.len(),
+                    libc::MSG_PEEK,
+                )
+            };
+            assert_eq!(n, 0);
+            attempts += 1;
+            if progressed.load(Ordering::Relaxed) || attempts == 10_000 {
+                Ok(())
+            } else {
+                // Returning WouldBlock for EOF violates async_io's contract.
+                // Even this misuse must not prevent other tasks from running.
+                Err(io::ErrorKind::WouldBlock.into())
+            }
+        })
+        .await
+        .unwrap();
+
+    assert!(progressed.load(Ordering::Relaxed));
+    assert!(attempts <= BUDGET + 1);
+    observer.await.unwrap();
+}
