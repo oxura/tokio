@@ -63,6 +63,14 @@ impl WakeList {
         self.curr += 1;
     }
 
+    #[cfg(any(
+        feature = "net",
+        feature = "process",
+        feature = "sync",
+        feature = "rt",
+        feature = "signal",
+        feature = "time",
+    ))]
     pub(crate) fn wake_all(&mut self) {
         let mut panics = WakeListPanic::default();
         self.wake_all_defer_panic(&mut panics);
